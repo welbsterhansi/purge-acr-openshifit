@@ -1813,7 +1813,7 @@ class TestAnalyzeAllRepos(unittest.TestCase):
             analyze_all_repos(MagicMock(), repos, keep=2, max_age_days=15, registry_url="r.azurecr.io")
 
         self.assertIsNotNone(captured.get("max_workers"), "max_workers deve ser explicitamente definido")
-        self.assertLessEqual(captured["max_workers"], 20, "max_workers não deve ultrapassar 20")
+        self.assertLessEqual(captured["max_workers"], 10, "max_workers não deve ultrapassar 10")
 
 
 # ══════════════════════════════════════════════════════════════════
