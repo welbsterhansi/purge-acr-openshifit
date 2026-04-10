@@ -24,7 +24,11 @@ python3 -m pytest test_purge.py -v
 
 ## Estado atual
 
-Suite: **139 testes passando**. Todos os goals P1–P5 + hardening + features adicionais completos.
+Suite: **228 testes passando** (`test_purge.py` + `test_openshift_prune.py`). Todos os goals P1–P5 + hardening + features adicionais completos.
+
+```bash
+python3 -m pytest test_purge.py test_openshift_prune.py -v
+```
 
 ### Implementado
 
@@ -36,8 +40,33 @@ Suite: **139 testes passando**. Todos os goals P1–P5 + hardening + features ad
 - **CLI** todos os parâmetros validados e testados: `--dry-run`, `--auto-approve`, `--keep`, `--max-age-days`, `--prefix`, `--registry`, `--skip-openshift`, `--in-cluster`
 - **`--protected-tags`** tags nunca deletadas independente da idade (ex: `latest,stable,production`)
 - **Output moderno** cabeçalhos com `◈`, tabelas sem bordas, alinhamento por f-strings, sem `===`
-- **OpenShift** digest não encontrado no cluster exibe `✅ [not in cluster — safe to delete]`
+- **PHASE 2 labels** distingue origem: `[running in pod]`, `[referenced in workload]`, `[in imagestream]`
 - **Thread safety** hardening em `_load_all` e `delete_all_candidates` com stress tests
+
+### OpenShift (`openshift_client.py`)
+
+Resources escaneados como `_active` (execução real):
+- Pods (`container_statuses[].image_id`)
+- Deployments, StatefulSets, DaemonSets, ReplicaSets (containers + init_containers)
+- DeploymentConfigs (containers + init_containers)
+- ReplicationControllers (containers + init_containers — protege rollback de DC)
+- Jobs, CronJobs
+- Builds (output + input via `strategy.*.from`)
+- BuildConfigs (input via `strategy.*.from`)
+
+Resources escaneados como `_historical` (existência no catálogo, não execução):
+- ImageStream — todos os items, incluindo `items[0]`
+- ImageStreamTags — imagem resolvida de cada tag
+
+> **Decisão de design:** ImageStream/IST marcam presença no registry, não execução.
+> Proteção real vem de pods e workloads. Evita que release tags antigas (ex: `1.0.0-release-20231214`)
+> apareçam como `[running]` quando nenhum pod as usa.
+
+### OpenShift (`openshift_prune.py`)
+
+Script separado para prune do histórico de ImageStream. Útil para times que usam **poucos tags com muitas revisões** (ex: `latest` atualizado semanalmente).
+
+> Para times com **uma tag por release**, usar `oc adm prune images` primeiro para limpar tags antigas.
 
 ---
 

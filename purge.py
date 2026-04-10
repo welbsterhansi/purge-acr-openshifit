@@ -471,6 +471,7 @@ if __name__ == "__main__":
         from openshift_client import OpenShiftClient
         try:
             oc_client = OpenShiftClient(in_cluster=IN_CLUSTER)
+            print(f"  Cluster state loaded: {len(oc_client._active)} active | {len(oc_client._historical)} historical digest(s)")
             print("  ✅ Connected to OpenShift cluster.")
         except Exception as e:
             print(f"\n  🚫 ABORT: Could not connect to OpenShift cluster: {e}")
