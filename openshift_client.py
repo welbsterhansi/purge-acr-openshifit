@@ -164,16 +164,13 @@ class OpenShiftClient:
             pods = self.core_api.list_namespaced_pod(ns).items
         except ApiException as e:
             if self._is_permission_error(e):
-                print(f"\n🚫 No permission to list pods in {ns}")
                 self.permission_incomplete = True
             return
 
         for pod in pods:
             location = f"{ns} / pod / {pod.metadata.name}"
-
             for cs in (pod.status.container_statuses or []):
                 self._add_active(cs.image_id, location)
-
             for cs in (pod.status.init_container_statuses or []):
                 self._add_active(cs.image_id, location)
 

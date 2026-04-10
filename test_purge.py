@@ -113,13 +113,13 @@ def _run_analyze(manifests, keep=2, max_age_days=15, protected_tags=None):
 # Extraída para função para ser testável sem subprocess
 # ══════════════════════════════════════════════════════════════════
 
-def run_phase0(skip_openshift, in_cluster, OpenShiftClient, namespace_prefix="prd-"):
+def run_phase0(skip_openshift, in_cluster, OpenShiftClient):
     """
     Replica a lógica do PHASE 0 do purge.py.
     Retorna (oc_client, exit_code) — exit_code None = não saiu.
 
-    namespace_prefix filters which namespaces are scanned for active digests.
-    Aborts if 0 namespaces are found after filtering.
+    Scans ALL namespaces accessible to the current user (namespace_prefix="").
+    Aborts if 0 namespaces are accessible (wrong cluster / no access).
     """
     if skip_openshift:
         print("  ⚠️  OpenShift check skipped (--skip-openshift).")
@@ -128,11 +128,10 @@ def run_phase0(skip_openshift, in_cluster, OpenShiftClient, namespace_prefix="pr
         return None, None
 
     try:
-        oc_client = OpenShiftClient(in_cluster=in_cluster, namespace_prefix=namespace_prefix)
+        oc_client = OpenShiftClient(in_cluster=in_cluster, namespace_prefix="")
         if not oc_client.namespaces:
-            print(f"\n  🚫 ABORT: Connected to cluster but found 0 namespaces matching '{namespace_prefix}'.")
-            print(f"     You may be logged into the wrong cluster.")
-            print(f"     Use --namespace-prefix to specify your environment prefix (e.g. qua-, dev-).")
+            print(f"\n  🚫 ABORT: Connected to cluster but found 0 accessible namespaces.")
+            print(f"     You may be logged into the wrong cluster or lack project access.")
             print(f"     Use --skip-openshift only if you accept running without protection.\n")
             return None, 1
         print(f"  Cluster state loaded: {len(oc_client._active)} active | {len(oc_client._historical)} historical digest(s)")
@@ -178,10 +177,11 @@ def apply_openshift_results(oc_client, all_results):
                 print(f"  ✅ {img['digest'][:19]}... [not in cluster — safe to delete]")
 
     if oc_client.permission_incomplete:
-        for r in all_results:
-            for img in r["images"]:
-                img["canDelete"]        = False
-                img["protectionReason"] = "insufficient_permissions"
+        print(
+            "  ⚠️  WARNING: Cluster scan was partial — some namespaces had permission errors.\n"
+            "      Images not found in accessible namespaces are treated as safe to delete.\n"
+            "      Ensure your service account has 'list pods' access to all relevant namespaces."
+        )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1070,13 +1070,25 @@ class TestApplyOpenShiftResults(unittest.TestCase):
         self.assertFalse(img["canDelete"])
         self.assertEqual(img["protectionReason"], "openshift_check_failed")
 
-    def test_permission_incomplete_blocks_all(self):
+    def test_permission_incomplete_does_not_block_deletions(self):
+        """permission_incomplete=True should NOT block deletions — only print a warning."""
         all_results = _make_results("sha256:any")
         oc = _make_oc_client(permission_incomplete=True)
-        apply_openshift_results(oc, all_results)
+        with patch("sys.stdout"):
+            apply_openshift_results(oc, all_results)
         img = all_results[0]["images"][0]
-        self.assertFalse(img["canDelete"])
-        self.assertEqual(img["protectionReason"], "insufficient_permissions")
+        # Image not found in cluster → canDelete must remain True
+        self.assertTrue(img["canDelete"])
+
+    def test_permission_incomplete_prints_warning(self):
+        """When permission_incomplete=True, a visible warning must be printed."""
+        import io
+        all_results = _make_results("sha256:any")
+        oc = _make_oc_client(permission_incomplete=True)
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            apply_openshift_results(oc, all_results)
+        self.assertIn("partial", buf.getvalue().lower())
 
     def test_oc_client_none_leaves_results_untouched(self):
         all_results = _make_results("sha256:candidate", can_delete=True)
@@ -2422,36 +2434,25 @@ class TestLoadReplicationControllers(unittest.TestCase):
 
 
 class TestInClusterFlag(unittest.TestCase):
-    """Verify that --in-cluster and --namespace-prefix are forwarded to OpenShiftClient."""
+    """Verify that --in-cluster is forwarded to OpenShiftClient and namespace_prefix is always ''."""
 
     def test_in_cluster_true_passed_to_constructor(self):
-        """run_phase0(in_cluster=True) must call OpenShiftClient(in_cluster=True, namespace_prefix='prd-')."""
+        """run_phase0(in_cluster=True) must call OpenShiftClient(in_cluster=True, namespace_prefix='')."""
         mock_oc = _make_oc_client()
         mock_oc.namespaces = ["prd-ns"]
         MockOC  = MagicMock(return_value=mock_oc)
         with patch("sys.stdout"):
             run_phase0(skip_openshift=False, in_cluster=True, OpenShiftClient=MockOC)
-        MockOC.assert_called_once_with(in_cluster=True, namespace_prefix="prd-")
+        MockOC.assert_called_once_with(in_cluster=True, namespace_prefix="")
 
     def test_in_cluster_false_passed_to_constructor(self):
-        """run_phase0(in_cluster=False) must call OpenShiftClient(in_cluster=False, namespace_prefix='prd-')."""
+        """run_phase0(in_cluster=False) must call OpenShiftClient(in_cluster=False, namespace_prefix='')."""
         mock_oc = _make_oc_client()
         mock_oc.namespaces = ["prd-ns"]
         MockOC  = MagicMock(return_value=mock_oc)
         with patch("sys.stdout"):
             run_phase0(skip_openshift=False, in_cluster=False, OpenShiftClient=MockOC)
-        MockOC.assert_called_once_with(in_cluster=False, namespace_prefix="prd-")
-
-    def test_custom_namespace_prefix_forwarded(self):
-        """Custom namespace_prefix must be passed through to OpenShiftClient."""
-        mock_oc = _make_oc_client()
-        mock_oc.namespaces = ["qua-ns"]
-        MockOC  = MagicMock(return_value=mock_oc)
-        with patch("sys.stdout"):
-            run_phase0(skip_openshift=False, in_cluster=False,
-                       OpenShiftClient=MockOC, namespace_prefix="qua-")
-        _, kwargs = MockOC.call_args
-        self.assertEqual(kwargs.get("namespace_prefix"), "qua-")
+        MockOC.assert_called_once_with(in_cluster=False, namespace_prefix="")
 
     def test_zero_namespaces_returns_exit_code_1(self):
         """If cluster has 0 accessible namespaces, run_phase0 must abort (exit code 1)."""
