@@ -18,6 +18,7 @@ Always dry-run by default. Zero-downtime guarantee by design.
 """
 
 import argparse
+import json
 import sys
 from datetime import datetime, timezone, timedelta
 
@@ -238,6 +239,47 @@ def print_candidates_table(candidates, max_rows=50):
         print(f"\n   ... and {remaining} more tags")
 
 
+def print_stream_summary(stats):
+    """Print per-stream breakdown: stream | total | kept | candidates."""
+    if not stats:
+        return
+
+    sorted_stats = sorted(stats, key=lambda s: s["candidates"], reverse=True)
+
+    col_ns     = max(len(s["namespace"]) for s in sorted_stats)
+    col_stream = max(len(s["stream"])    for s in sorted_stats)
+
+    print(f"\n◈  Stream breakdown\n")
+    print(f"   {'Namespace':<{col_ns}}  {'Stream':<{col_stream}}  {'Total':>6}  {'Kept':>6}  {'Candidates':>10}")
+    print(f"   {'-'*col_ns}  {'-'*col_stream}  {'------':>6}  {'------':>6}  {'----------':>10}")
+
+    for s in sorted_stats:
+        kept = s["total"] - s["candidates"]
+        print(
+            f"   {s['namespace']:<{col_ns}}  {s['stream']:<{col_stream}}"
+            f"  {s['total']:>6}  {kept:>6}  {s['candidates']:>10}"
+        )
+
+
+def save_json_report(candidates, stream_stats, mode, run_timestamp,
+                     namespace_prefix, keep_revisions, younger_than, protected_tags):
+    """Save a JSON report file and return the filename."""
+    payload = {
+        "run_timestamp":    run_timestamp,
+        "mode":             mode,
+        "namespace_prefix": namespace_prefix,
+        "keep_revisions":   keep_revisions,
+        "younger_than":     younger_than,
+        "protected_tags":   protected_tags,
+        "candidates":       candidates,
+        "stream_summary":   stream_stats,
+    }
+    filename = f"report-prune-{run_timestamp}.json"
+    with open(filename, "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+    return filename
+
+
 def print_summary(candidates, dry_run, namespace_prefix,
                   keep_revisions, younger_than, protected_tags):
     """Print the summary section after pruning."""
@@ -322,7 +364,7 @@ if __name__ == "__main__":
     )
 
     try:
-        oc = OpenShiftClient(in_cluster=IN_CLUSTER)
+        oc = OpenShiftClient(in_cluster=IN_CLUSTER, namespace_prefix=NS_PREFIX)
     except Exception as e:
         print(f"\n  🚫 ABORT: Could not connect to OpenShift cluster: {e}")
         sys.exit(1)
@@ -330,6 +372,11 @@ if __name__ == "__main__":
     # Filter to only the requested namespace prefix ("" = all prd-* namespaces)
     oc.namespaces = [ns for ns in oc.namespaces if ns.startswith(NS_PREFIX)]
     ns_label = f"{NS_PREFIX}*" if NS_PREFIX else "all prd-*"
+
+    if not oc.namespaces:
+        print(f"\n  🚫 ABORT: No namespaces found matching prefix '{NS_PREFIX}'.")
+        print(f"     Check that the prefix is correct and you have cluster access.")
+        sys.exit(1)
 
     print(f"\n   Status:")
     print(f"     Cluster state:   {len(oc._active)} active | {len(oc._historical)} historical digests loaded.")
@@ -343,7 +390,51 @@ if __name__ == "__main__":
         dry_run        = DRY_RUN,
     )
 
+    # Build per-stream stats
+    from collections import defaultdict
+    stream_totals     = defaultdict(lambda: {"namespace": "", "total": 0})
+    stream_candidates = defaultdict(int)
+
+    for ns in oc.namespaces:
+        try:
+            ist_items = oc.istag_api.get(namespace=ns).items
+            for ist in ist_items:
+                parts = ist.metadata.name.split(":", 1)
+                if len(parts) == 2:
+                    key = (ns, parts[0])
+                    stream_totals[key]["namespace"] = ns
+                    stream_totals[key]["total"]    += 1
+        except Exception:
+            pass
+
+    for c in candidates:
+        stream_candidates[(c["namespace"], c["stream"])] += 1
+
+    stream_stats = [
+        {
+            "namespace":  ns,
+            "stream":     stream,
+            "total":      stream_totals[(ns, stream)]["total"],
+            "candidates": stream_candidates[(ns, stream)],
+        }
+        for (ns, stream) in stream_totals
+    ]
+
+    print_stream_summary(stream_stats)
     print_candidates_table(candidates)
+
+    run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    report_path = save_json_report(
+        candidates       = candidates,
+        stream_stats     = stream_stats,
+        mode             = mode,
+        run_timestamp    = run_timestamp,
+        namespace_prefix = NS_PREFIX,
+        keep_revisions   = KEEP_REVISIONS,
+        younger_than     = args.younger_than,
+        protected_tags   = PROTECTED_TAGS,
+    )
+    print(f"\n   Report saved: {report_path}")
 
     print_summary(
         candidates       = candidates,

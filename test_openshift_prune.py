@@ -25,6 +25,8 @@ from openshift_prune import (
     parse_args,
     print_settings,
     print_candidates_table,
+    print_stream_summary,
+    save_json_report,
     print_summary,
 )
 
@@ -667,6 +669,194 @@ class TestPrintCandidatesTable(unittest.TestCase):
         cands = [self._cand(tag=f"{i}.0.0") for i in range(25)]
         output = self._capture(cands, max_rows=10)
         self.assertIn("15", output)  # 25 - 10 = 15 more
+
+
+# ══════════════════════════════════════════════════════════════════
+# print_stream_summary
+# ══════════════════════════════════════════════════════════════════
+
+class TestPrintStreamSummary(unittest.TestCase):
+
+    def _stat(self, stream, total, candidates, ns="prd-ns"):
+        return {"namespace": ns, "stream": stream, "total": total, "candidates": candidates}
+
+    def _capture(self, stats):
+        import io
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            print_stream_summary(stats)
+        return buf.getvalue()
+
+    def test_shows_section_header(self):
+        output = self._capture([self._stat("trading", 10, 5)])
+        self.assertIn("◈", output)
+
+    def test_shows_stream_name(self):
+        output = self._capture([self._stat("dotnet-service-trading", 65, 55)])
+        self.assertIn("dotnet-service-trading", output)
+
+    def test_shows_total_kept_candidates_columns(self):
+        output = self._capture([self._stat("trading", 10, 5)])
+        self.assertIn("10", output)   # total
+        self.assertIn("5",  output)   # kept = 10 - 5 = 5
+        self.assertIn("5",  output)   # candidates
+
+    def test_kept_computed_as_total_minus_candidates(self):
+        """kept = total - candidates."""
+        output = self._capture([self._stat("trading", 65, 55)])
+        # kept = 65 - 55 = 10
+        self.assertIn("10", output)
+
+    def test_sorted_by_candidates_descending(self):
+        stats = [
+            self._stat("small-app", 5, 0),
+            self._stat("big-app",   80, 70),
+        ]
+        output = self._capture(stats)
+        idx_big   = output.index("big-app")
+        idx_small = output.index("small-app")
+        self.assertLess(idx_big, idx_small)
+
+    def test_zero_candidate_streams_shown(self):
+        """Streams with 0 candidates must still appear (to show they are all kept)."""
+        stats = [self._stat("advisory", 4, 0)]
+        output = self._capture(stats)
+        self.assertIn("advisory", output)
+
+    def test_namespace_shown(self):
+        output = self._capture([self._stat("trading", 10, 5, ns="prd-wealthmanagement")])
+        self.assertIn("prd-wealthmanagement", output)
+
+    def test_empty_stats_no_table(self):
+        output = self._capture([])
+        self.assertEqual(output.strip(), "")
+
+
+# ══════════════════════════════════════════════════════════════════
+# save_json_report
+# ══════════════════════════════════════════════════════════════════
+
+class TestSaveJsonReport(unittest.TestCase):
+
+    def _make_candidate(self, ns, stream, tag, digest="sha256:abc"):
+        return {"namespace": ns, "stream": stream, "tag": tag, "digest": digest}
+
+    def _make_stat(self, ns, stream, total, candidates):
+        return {"namespace": ns, "stream": stream, "total": total, "candidates": candidates}
+
+    def _run(self, candidates=None, stream_stats=None, mode="DRY_RUN",
+             namespace_prefix="prd-ns", keep_revisions=10, younger_than="24h",
+             protected_tags=None, timestamp="20250101_120000"):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmp:
+            orig_dir = os.getcwd()
+            os.chdir(tmp)
+            try:
+                path = save_json_report(
+                    candidates       = candidates or [],
+                    stream_stats     = stream_stats or [],
+                    mode             = mode,
+                    run_timestamp    = timestamp,
+                    namespace_prefix = namespace_prefix,
+                    keep_revisions   = keep_revisions,
+                    younger_than     = younger_than,
+                    protected_tags   = protected_tags or [],
+                )
+                import json
+                with open(path) as f:
+                    return json.load(f)
+            finally:
+                os.chdir(orig_dir)
+
+    def test_returns_filename(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmp:
+            orig_dir = os.getcwd()
+            os.chdir(tmp)
+            try:
+                path = save_json_report(
+                    candidates=[], stream_stats=[], mode="DRY_RUN",
+                    run_timestamp="20250101_120000", namespace_prefix="prd-",
+                    keep_revisions=10, younger_than="24h", protected_tags=[],
+                )
+                self.assertTrue(path.endswith(".json"))
+            finally:
+                os.chdir(orig_dir)
+
+    def test_payload_contains_mode(self):
+        data = self._run(mode="DRY_RUN")
+        self.assertEqual(data["mode"], "DRY_RUN")
+
+    def test_payload_contains_namespace_prefix(self):
+        data = self._run(namespace_prefix="prd-wealthmanagement")
+        self.assertEqual(data["namespace_prefix"], "prd-wealthmanagement")
+
+    def test_payload_contains_keep_revisions(self):
+        data = self._run(keep_revisions=5)
+        self.assertEqual(data["keep_revisions"], 5)
+
+    def test_payload_contains_candidates(self):
+        cands = [self._make_candidate("prd-ns", "trading", "1.0.0")]
+        data = self._run(candidates=cands)
+        self.assertEqual(len(data["candidates"]), 1)
+        self.assertEqual(data["candidates"][0]["stream"], "trading")
+        self.assertEqual(data["candidates"][0]["tag"],    "1.0.0")
+
+    def test_payload_contains_stream_summary(self):
+        stats = [self._make_stat("prd-ns", "trading", 10, 5)]
+        data = self._run(stream_stats=stats)
+        self.assertEqual(len(data["stream_summary"]), 1)
+        self.assertEqual(data["stream_summary"][0]["stream"],     "trading")
+        self.assertEqual(data["stream_summary"][0]["total"],      10)
+        self.assertEqual(data["stream_summary"][0]["candidates"], 5)
+
+    def test_filename_contains_timestamp(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmp:
+            orig_dir = os.getcwd()
+            os.chdir(tmp)
+            try:
+                path = save_json_report(
+                    candidates=[], stream_stats=[], mode="DRY_RUN",
+                    run_timestamp="20250410_143000", namespace_prefix="prd-",
+                    keep_revisions=10, younger_than="24h", protected_tags=[],
+                )
+                self.assertIn("20250410_143000", path)
+            finally:
+                os.chdir(orig_dir)
+
+
+# ══════════════════════════════════════════════════════════════════
+# OpenShiftClient namespace_prefix parameter
+# ══════════════════════════════════════════════════════════════════
+
+class TestOpenShiftClientNamespacePrefix(unittest.TestCase):
+    """OpenShiftClient must accept namespace_prefix to load non-prd namespaces."""
+
+    def _make_oc_client_class(self, namespaces):
+        """Minimal stub that replaces OpenShiftClient for unit testing."""
+        from openshift_client import OpenShiftClient
+        oc = MagicMock(spec=OpenShiftClient)
+        oc._active     = {}
+        oc._historical = {}
+        oc.namespaces  = namespaces
+        return oc
+
+    def test_default_prefix_is_prd(self):
+        """Without argument, OpenShiftClient must still default to prd-."""
+        import inspect
+        from openshift_client import OpenShiftClient
+        sig = inspect.signature(OpenShiftClient.__init__)
+        default = sig.parameters.get("namespace_prefix")
+        self.assertIsNotNone(default, "namespace_prefix parameter must exist")
+        self.assertEqual(default.default, "prd-")
+
+    def test_namespace_prefix_parameter_exists(self):
+        """OpenShiftClient.__init__ must accept namespace_prefix kwarg."""
+        import inspect
+        from openshift_client import OpenShiftClient
+        sig = inspect.signature(OpenShiftClient.__init__)
+        self.assertIn("namespace_prefix", sig.parameters)
 
 
 # ══════════════════════════════════════════════════════════════════

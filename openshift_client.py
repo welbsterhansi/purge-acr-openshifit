@@ -25,7 +25,9 @@ class OpenShiftClient:
 
     NAMESPACE_PREFIX = "prd-"
 
-    def __init__(self, in_cluster=False):
+    def __init__(self, in_cluster=False, namespace_prefix="prd-"):
+        self.NAMESPACE_PREFIX = namespace_prefix
+
         if in_cluster:
             config.load_incluster_config()
         else:
