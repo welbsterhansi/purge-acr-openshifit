@@ -117,6 +117,10 @@ def run_phase0(skip_openshift, in_cluster, OpenShiftClient):
     """
     Replica a lógica do PHASE 0 do purge.py.
     Retorna (oc_client, exit_code) — exit_code None = não saiu.
+
+    Passes namespace_prefix="" so ALL namespaces from the connected cluster
+    are loaded — protecting images regardless of environment prefix.
+    Aborts if 0 namespaces are found (wrong cluster or no access).
     """
     if skip_openshift:
         print("  ⚠️  OpenShift check skipped (--skip-openshift).")
@@ -125,7 +129,13 @@ def run_phase0(skip_openshift, in_cluster, OpenShiftClient):
         return None, None
 
     try:
-        oc_client = OpenShiftClient(in_cluster=in_cluster)
+        oc_client = OpenShiftClient(in_cluster=in_cluster, namespace_prefix="")
+        if not oc_client.namespaces:
+            print(f"\n  🚫 ABORT: Connected to cluster but found 0 accessible namespaces.")
+            print("     You may be logged into the wrong cluster or lack permissions.")
+            print("     Use --skip-openshift only if you accept running without protection.\n")
+            return None, 1
+        print(f"  Cluster state loaded: {len(oc_client._active)} active | {len(oc_client._historical)} historical digest(s)")
         print("  ✅ Connected to OpenShift cluster.\n")
         return oc_client, None
     except Exception as e:
@@ -820,14 +830,18 @@ class TestPhase0OpenShiftConnectivity(unittest.TestCase):
 
     def test_cluster_ok_returns_exit_none(self):
         mock_oc = _make_oc_client()
+        mock_oc.namespaces = ["prd-ns"]
         MockOC  = MagicMock(return_value=mock_oc)
-        _, exit_code = run_phase0(skip_openshift=False, in_cluster=False, OpenShiftClient=MockOC)
+        with patch("sys.stdout"):
+            _, exit_code = run_phase0(skip_openshift=False, in_cluster=False, OpenShiftClient=MockOC)
         self.assertIsNone(exit_code)
 
     def test_cluster_ok_returns_oc_client(self):
         mock_oc = _make_oc_client()
+        mock_oc.namespaces = ["prd-ns"]
         MockOC  = MagicMock(return_value=mock_oc)
-        oc_client, _ = run_phase0(skip_openshift=False, in_cluster=False, OpenShiftClient=MockOC)
+        with patch("sys.stdout"):
+            oc_client, _ = run_phase0(skip_openshift=False, in_cluster=False, OpenShiftClient=MockOC)
         self.assertEqual(oc_client, mock_oc)
 
     def test_dry_run_also_exits_if_cluster_unreachable(self):
@@ -1127,6 +1141,17 @@ def _sample_results(prefix="homebuying"):
 
 
 class TestReports(unittest.TestCase):
+
+    def setUp(self):
+        import os
+        self._orig_dir = os.path.abspath(".")
+
+    def tearDown(self):
+        import os
+        try:
+            os.chdir(self._orig_dir)
+        except FileNotFoundError:
+            os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
     def test_json_report_fields(self):
         import tempfile, os
@@ -2397,23 +2422,63 @@ class TestLoadReplicationControllers(unittest.TestCase):
 
 
 class TestInClusterFlag(unittest.TestCase):
-    """Verify that --in-cluster is forwarded to OpenShiftClient."""
+    """Verify that --in-cluster and namespace_prefix="" are forwarded to OpenShiftClient."""
 
     def test_in_cluster_true_passed_to_constructor(self):
-        """run_phase0(in_cluster=True) must call OpenShiftClient(in_cluster=True)."""
+        """run_phase0(in_cluster=True) must call OpenShiftClient(in_cluster=True, namespace_prefix='')."""
         mock_oc = _make_oc_client()
+        mock_oc.namespaces = ["prd-ns"]
         MockOC  = MagicMock(return_value=mock_oc)
         with patch("sys.stdout"):
             run_phase0(skip_openshift=False, in_cluster=True, OpenShiftClient=MockOC)
-        MockOC.assert_called_once_with(in_cluster=True)
+        MockOC.assert_called_once_with(in_cluster=True, namespace_prefix="")
 
     def test_in_cluster_false_passed_to_constructor(self):
-        """run_phase0(in_cluster=False) must call OpenShiftClient(in_cluster=False)."""
+        """run_phase0(in_cluster=False) must call OpenShiftClient(in_cluster=False, namespace_prefix='')."""
         mock_oc = _make_oc_client()
+        mock_oc.namespaces = ["prd-ns"]
         MockOC  = MagicMock(return_value=mock_oc)
         with patch("sys.stdout"):
             run_phase0(skip_openshift=False, in_cluster=False, OpenShiftClient=MockOC)
-        MockOC.assert_called_once_with(in_cluster=False)
+        MockOC.assert_called_once_with(in_cluster=False, namespace_prefix="")
+
+    def test_namespace_prefix_empty_string_always_passed(self):
+        """namespace_prefix='' must always be passed so ALL cluster namespaces are loaded."""
+        mock_oc = _make_oc_client()
+        mock_oc.namespaces = ["qua-ns"]
+        MockOC  = MagicMock(return_value=mock_oc)
+        with patch("sys.stdout"):
+            run_phase0(skip_openshift=False, in_cluster=False, OpenShiftClient=MockOC)
+        _, kwargs = MockOC.call_args
+        self.assertEqual(kwargs.get("namespace_prefix"), "")
+
+    def test_zero_namespaces_returns_exit_code_1(self):
+        """If cluster has 0 accessible namespaces, run_phase0 must abort (exit code 1)."""
+        mock_oc = _make_oc_client()
+        mock_oc.namespaces = []          # simulates wrong cluster / no access
+        MockOC  = MagicMock(return_value=mock_oc)
+        with patch("sys.stdout"):
+            _, exit_code = run_phase0(skip_openshift=False, in_cluster=False, OpenShiftClient=MockOC)
+        self.assertEqual(exit_code, 1)
+
+    def test_zero_namespaces_returns_no_client(self):
+        """When aborting due to 0 namespaces, oc_client returned must be None."""
+        mock_oc = _make_oc_client()
+        mock_oc.namespaces = []
+        MockOC  = MagicMock(return_value=mock_oc)
+        with patch("sys.stdout"):
+            oc_client, _ = run_phase0(skip_openshift=False, in_cluster=False, OpenShiftClient=MockOC)
+        self.assertIsNone(oc_client)
+
+    def test_nonzero_namespaces_returns_client(self):
+        """When namespaces are found, oc_client must be returned."""
+        mock_oc = _make_oc_client()
+        mock_oc.namespaces = ["prd-ns", "prd-other"]
+        MockOC  = MagicMock(return_value=mock_oc)
+        with patch("sys.stdout"):
+            oc_client, exit_code = run_phase0(skip_openshift=False, in_cluster=False, OpenShiftClient=MockOC)
+        self.assertIsNotNone(oc_client)
+        self.assertIsNone(exit_code)
 
     def test_skip_openshift_never_uses_in_cluster(self):
         """When --skip-openshift is set, OpenShiftClient is never called."""

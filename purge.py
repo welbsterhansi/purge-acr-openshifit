@@ -470,7 +470,12 @@ if __name__ == "__main__":
     else:
         from openshift_client import OpenShiftClient
         try:
-            oc_client = OpenShiftClient(in_cluster=IN_CLUSTER)
+            oc_client = OpenShiftClient(in_cluster=IN_CLUSTER, namespace_prefix="")
+            if not oc_client.namespaces:
+                print(f"\n  🚫 ABORT: Connected to cluster but found 0 accessible namespaces.")
+                print("     You may be logged into the wrong cluster or lack permissions.")
+                print("     Use --skip-openshift only if you accept running without protection.")
+                exit(1)
             print(f"  Cluster state loaded: {len(oc_client._active)} active | {len(oc_client._historical)} historical digest(s)")
             print("  ✅ Connected to OpenShift cluster.")
         except Exception as e:
