@@ -1797,6 +1797,24 @@ class TestAnalyzeAllRepos(unittest.TestCase):
         results = analyze_all_repos(MagicMock(), [], keep=2, max_age_days=15, registry_url="r.azurecr.io")
         self.assertEqual(results, [])
 
+    def test_max_workers_capped_at_20(self):
+        """ThreadPoolExecutor deve usar no máximo 20 workers para evitar OOM com muitos repos."""
+        captured = {}
+
+        original_tpe = __import__("concurrent.futures", fromlist=["ThreadPoolExecutor"]).ThreadPoolExecutor
+
+        def fake_tpe(*args, **kwargs):
+            captured["max_workers"] = kwargs.get("max_workers")
+            return original_tpe(*args, **kwargs)
+
+        repos = [f"repo/{i}" for i in range(50)]
+        with patch("purge.ThreadPoolExecutor", side_effect=fake_tpe), \
+             patch("purge.analyze_repo", return_value={"repository": "x", "images": []}):
+            analyze_all_repos(MagicMock(), repos, keep=2, max_age_days=15, registry_url="r.azurecr.io")
+
+        self.assertIsNotNone(captured.get("max_workers"), "max_workers deve ser explicitamente definido")
+        self.assertLessEqual(captured["max_workers"], 20, "max_workers não deve ultrapassar 20")
+
 
 # ══════════════════════════════════════════════════════════════════
 # delete_all_candidates — deleção em paralelo com semáforo (P5)

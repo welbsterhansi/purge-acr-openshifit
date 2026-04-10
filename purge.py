@@ -242,7 +242,7 @@ def analyze_all_repos(client, repos, keep, max_age_days, registry_url, protected
     if not repos:
         return []
     results = []
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=20) as executor:
         futures = {
             executor.submit(
                 analyze_repo, client, repo, keep, max_age_days,
