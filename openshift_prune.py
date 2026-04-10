@@ -209,14 +209,33 @@ def run_prune(oc_client, keep_revisions, younger_than, protected_tags, dry_run):
 # OUTPUT FORMATTING
 # ============================================================
 
-def print_settings(mode, keep_revisions, younger_than, protected_tags):
+def print_settings(mode, namespace_prefix, keep_revisions, younger_than, protected_tags):
     """Print the header and settings section."""
     tags_str = ", ".join(protected_tags) if protected_tags else "(none)"
     print(f"\n◈  OpenShift ImageStream Prune  ·  mode: {mode}\n")
     print(f"   Settings:")
-    print(f"     keep-revisions:  {keep_revisions}")
-    print(f"     younger-than:    {younger_than}")
-    print(f"     protected-tags:  {tags_str}")
+    print(f"     namespace-prefix: {namespace_prefix}")
+    print(f"     keep-revisions:   {keep_revisions}")
+    print(f"     younger-than:     {younger_than}")
+    print(f"     protected-tags:   {tags_str}")
+
+
+def print_candidates_table(candidates, max_rows=50):
+    """Print the table of tags eligible for deletion."""
+    if not candidates:
+        return
+
+    print(f"\n◈  Candidates — tags eligible for deletion\n")
+    col_ns     = max(len(c["namespace"]) for c in candidates)
+    col_stream = max(len(c["stream"])    for c in candidates)
+
+    shown = candidates[:max_rows]
+    for c in shown:
+        print(f"   {c['namespace']:<{col_ns}}  {c['stream']:<{col_stream}}  {c['tag']}")
+
+    remaining = len(candidates) - len(shown)
+    if remaining > 0:
+        print(f"\n   ... and {remaining} more tags")
 
 
 def print_summary(candidates, dry_run, namespace_prefix,
@@ -295,10 +314,11 @@ if __name__ == "__main__":
     from openshift_client import OpenShiftClient
 
     print_settings(
-        mode           = mode,
-        keep_revisions = KEEP_REVISIONS,
-        younger_than   = args.younger_than,
-        protected_tags = PROTECTED_TAGS,
+        mode             = mode,
+        namespace_prefix = NS_PREFIX,
+        keep_revisions   = KEEP_REVISIONS,
+        younger_than     = args.younger_than,
+        protected_tags   = PROTECTED_TAGS,
     )
 
     try:
@@ -307,8 +327,13 @@ if __name__ == "__main__":
         print(f"\n  🚫 ABORT: Could not connect to OpenShift cluster: {e}")
         sys.exit(1)
 
+    # Filter to only the requested namespace prefix ("" = all prd-* namespaces)
+    oc.namespaces = [ns for ns in oc.namespaces if ns.startswith(NS_PREFIX)]
+    ns_label = f"{NS_PREFIX}*" if NS_PREFIX else "all prd-*"
+
     print(f"\n   Status:")
     print(f"     Cluster state:   {len(oc._active)} active | {len(oc._historical)} historical digests loaded.")
+    print(f"     Namespaces:      {len(oc.namespaces)}  ({ns_label})")
 
     candidates = run_prune(
         oc_client      = oc,
@@ -317,6 +342,8 @@ if __name__ == "__main__":
         protected_tags = PROTECTED_TAGS,
         dry_run        = DRY_RUN,
     )
+
+    print_candidates_table(candidates)
 
     print_summary(
         candidates       = candidates,

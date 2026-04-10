@@ -20,6 +20,7 @@ az acr gc --registry <r>    ← free physical storage in ACR
 - Images referenced in workloads (DC, Deployment, StatefulSet, Job, etc.) are never deleted
 - Images referenced in ImageStream tags are protected until pruned there first
 - `--protected-tags` ensures specific tags are never deleted regardless of age
+- Active digests from **all** `prd-*` namespaces are loaded regardless of `--namespace-prefix` — a digest used anywhere in the cluster is always protected
 
 ---
 
@@ -27,7 +28,7 @@ az acr gc --registry <r>    ← free physical storage in ACR
 
 Removes old **entire tags** from each ImageStream. Designed for the one-tag-per-release pattern where each release gets its own unique tag (e.g. `dotnet-service-trading:5.6.4`).
 
-Run this **before** `purge.py` so that old tags are removed from OpenShift and `purge.py` can then safely clean the ACR.
+Run this **before** `purge.py` so that old tags are removed from OpenShift and `purge.py` can then safely clean ACR.
 
 ### Parameters
 
@@ -35,21 +36,24 @@ Run this **before** `purge.py` so that old tags are removed from OpenShift and `
 |---|---|---|
 | `--keep-revisions` | `10` | Most recent tags to keep per ImageStream |
 | `--younger-than` | `24h` | Preserve tags newer than this window (h, m, d) |
-| `--namespace-prefix` | `prd-` | Only scan namespaces with this prefix |
+| `--namespace-prefix` | `prd-` | Only prune namespaces with this prefix. Pass `""` to scan all `prd-*` namespaces |
 | `--protected-tags` | `""` | Tags never pruned (e.g. `latest,stable,production`) |
 | `--dry-run` | `true` | `true` = simulate \| `false` = delete for real |
 | `--in-cluster` | `false` | Load kubeconfig from inside a pod |
 
-### Examples
+### Namespace filtering
 
-**Dry run — all namespaces matching `prd-`:**
 ```bash
-python3 openshift_prune.py \
-  --keep-revisions 2 \
-  --younger-than 24h \
-  --protected-tags latest,stable \
-  --dry-run true
+# Single namespace
+--namespace-prefix prd-contoso-payments
+# → Namespaces: 1  (prd-contoso-payments*)
+
+# All prd-* namespaces
+--namespace-prefix ""
+# → Namespaces: 15  (all prd-*)
 ```
+
+### Examples
 
 **Dry run — single namespace:**
 ```bash
@@ -60,10 +64,30 @@ python3 openshift_prune.py \
   --dry-run true
 ```
 
-**Live run — apply deletions:**
+**Dry run — all prd-* namespaces:**
+```bash
+python3 openshift_prune.py \
+  --namespace-prefix "" \
+  --keep-revisions 2 \
+  --younger-than 24h \
+  --protected-tags latest,stable \
+  --dry-run true
+```
+
+**Live run — single namespace:**
 ```bash
 python3 openshift_prune.py \
   --namespace-prefix prd-contoso-payments \
+  --keep-revisions 2 \
+  --younger-than 24h \
+  --protected-tags latest,stable \
+  --dry-run false
+```
+
+**Live run — all prd-* namespaces:**
+```bash
+python3 openshift_prune.py \
+  --namespace-prefix "" \
   --keep-revisions 2 \
   --younger-than 24h \
   --protected-tags latest,stable \
@@ -74,6 +98,7 @@ python3 openshift_prune.py \
 ```bash
 python3 openshift_prune.py \
   --in-cluster \
+  --namespace-prefix "" \
   --keep-revisions 2 \
   --younger-than 24h \
   --dry-run false
@@ -159,16 +184,16 @@ python3 purge.py \
 ## Recommended execution order
 
 ```bash
-# 1. Dry run — review which ImageStream tags would be removed
+# 1. Dry run — review which ImageStream tags would be removed (single namespace)
 python3 openshift_prune.py \
-  --namespace-prefix prd- \
+  --namespace-prefix prd-contoso-payments \
   --keep-revisions 2 \
   --younger-than 24h \
   --dry-run true
 
 # 2. Apply ImageStream tag cleanup
 python3 openshift_prune.py \
-  --namespace-prefix prd- \
+  --namespace-prefix prd-contoso-payments \
   --keep-revisions 2 \
   --younger-than 24h \
   --dry-run false
@@ -196,6 +221,38 @@ az acr gc --registry contosoregistry
 ---
 
 ## Understanding the output
+
+### `openshift_prune.py` output sections
+
+```
+◈  OpenShift ImageStream Prune  ·  mode: DRY_RUN
+
+   Settings:
+     namespace-prefix: prd-contoso-payments
+     keep-revisions:   2
+     younger-than:     24h
+     protected-tags:   (none)
+
+   Status:
+     Cluster state:   943 active | 983 historical digests loaded.
+     Namespaces:      1  (prd-contoso-payments*)
+
+◈  Candidates — tags eligible for deletion
+
+   prd-contoso-payments  dotnet-service-trading   1.0.0
+   prd-contoso-payments  dotnet-service-trading   1.1.0
+   ...
+   ... and N more tags
+
+◈  Summary
+
+   Candidates found: 42
+
+   To apply changes, run:
+   python3 openshift_prune.py --namespace-prefix prd-contoso-payments ...
+```
+
+> **Note:** Tags not listed as candidates are protected — either within `--keep-revisions`, active in the cluster, newer than `--younger-than`, or in `--protected-tags`.
 
 ### `purge.py` PHASE 2 labels
 

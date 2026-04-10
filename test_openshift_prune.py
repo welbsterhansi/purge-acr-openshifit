@@ -24,6 +24,7 @@ from openshift_prune import (
     run_prune,
     parse_args,
     print_settings,
+    print_candidates_table,
     print_summary,
 )
 
@@ -511,16 +512,17 @@ class TestParseArgs(unittest.TestCase):
 
 class TestPrintSettings(unittest.TestCase):
 
-    def _capture(self, mode="DRY_RUN", keep_revisions=10,
-                 younger_than="24h", protected_tags=None):
+    def _capture(self, mode="DRY_RUN", namespace_prefix="prd-",
+                 keep_revisions=10, younger_than="24h", protected_tags=None):
         import io
         buf = io.StringIO()
         with patch("sys.stdout", buf):
             print_settings(
-                mode           = mode,
-                keep_revisions = keep_revisions,
-                younger_than   = younger_than,
-                protected_tags = protected_tags or [],
+                mode             = mode,
+                namespace_prefix = namespace_prefix,
+                keep_revisions   = keep_revisions,
+                younger_than     = younger_than,
+                protected_tags   = protected_tags or [],
             )
         return buf.getvalue()
 
@@ -531,6 +533,10 @@ class TestPrintSettings(unittest.TestCase):
     def test_settings_section_label(self):
         output = self._capture()
         self.assertIn("Settings:", output)
+
+    def test_namespace_prefix_shown(self):
+        output = self._capture(namespace_prefix="prd-wealthmanagement")
+        self.assertIn("prd-wealthmanagement", output)
 
     def test_keep_revisions_with_colon(self):
         output = self._capture(keep_revisions=10)
@@ -604,6 +610,63 @@ class TestPrintSummary(unittest.TestCase):
     def test_live_run_no_apply_command(self):
         output = self._capture(dry_run=False)
         self.assertNotIn("--dry-run false", output)
+
+
+# ══════════════════════════════════════════════════════════════════
+# print_candidates_table
+# ══════════════════════════════════════════════════════════════════
+
+class TestPrintCandidatesTable(unittest.TestCase):
+
+    def _cand(self, ns="prd-ns", stream="trading", tag="1.0.0"):
+        return {"namespace": ns, "stream": stream, "tag": tag,
+                "digest": "sha256:abc", "reason": "eligible"}
+
+    def _capture(self, candidates, max_rows=50):
+        import io
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            print_candidates_table(candidates, max_rows=max_rows)
+        return buf.getvalue()
+
+    def test_empty_candidates_prints_nothing(self):
+        """No table output when there are no candidates."""
+        output = self._capture([])
+        self.assertEqual(output.strip(), "")
+
+    def test_shows_header_section(self):
+        """A section header must appear when there are candidates."""
+        output = self._capture([self._cand()])
+        self.assertIn("◈", output)
+
+    def test_shows_stream_for_each_candidate(self):
+        output = self._capture([self._cand(stream="dotnet-service-trading")])
+        self.assertIn("dotnet-service-trading", output)
+
+    def test_shows_tag_for_each_candidate(self):
+        output = self._capture([self._cand(tag="5.6.4")])
+        self.assertIn("5.6.4", output)
+
+    def test_shows_namespace_for_each_candidate(self):
+        output = self._capture([self._cand(ns="prd-wealthmanagement")])
+        self.assertIn("prd-wealthmanagement", output)
+
+    def test_truncates_with_and_more_footer(self):
+        """When candidates exceed max_rows, show '... and N more'."""
+        cands = [self._cand(tag=f"{i}.0.0") for i in range(100)]
+        output = self._capture(cands, max_rows=10)
+        self.assertIn("and", output)
+        self.assertIn("more", output)
+
+    def test_no_truncation_when_under_limit(self):
+        cands = [self._cand(tag=f"{i}.0.0") for i in range(5)]
+        output = self._capture(cands, max_rows=10)
+        self.assertNotIn("more", output)
+
+    def test_truncation_shows_correct_remaining_count(self):
+        cands = [self._cand(tag=f"{i}.0.0") for i in range(25)]
+        output = self._capture(cands, max_rows=10)
+        self.assertIn("15", output)  # 25 - 10 = 15 more
 
 
 # ══════════════════════════════════════════════════════════════════
