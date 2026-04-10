@@ -330,13 +330,14 @@ class TestRunPrune(unittest.TestCase):
 
     def _prune(self, oc, dry_run=True, keep_revisions=1,
                younger_than="1h", protected_tags=None):
-        return run_prune(
+        candidates, _ = run_prune(
             oc_client      = oc,
             keep_revisions = keep_revisions,
             younger_than   = parse_younger_than(younger_than),
             protected_tags = protected_tags or [],
             dry_run        = dry_run,
         )
+        return candidates
 
     def test_dry_run_never_calls_delete(self):
         """dry_run=True must not call delete_istag."""
@@ -449,6 +450,90 @@ class TestRunPrune(unittest.TestCase):
             self._prune(oc, dry_run=False, keep_revisions=1)
 
         self.assertIn("1.0.0", calls)
+
+
+# ══════════════════════════════════════════════════════════════════
+# collect_tag_candidates — _reasons tracking
+# ══════════════════════════════════════════════════════════════════
+
+class TestCollectTagCandidatesReasons(unittest.TestCase):
+    """collect_tag_candidates populates _reasons dict when provided."""
+
+    def _grouped(self, stream, specs, ns="prd-ns"):
+        ists = [_make_ist(stream, tag, ns=ns, created_days_ago=days, digest_suffix=dig)
+                for tag, days, dig in specs]
+        ists.sort(key=lambda i: i.metadata.creationTimestamp, reverse=True)
+        return {stream: ists}
+
+    def _collect(self, grouped, active=None, keep=1, young="1h", protected=None):
+        reasons = {}
+        collect_tag_candidates(
+            grouped_tags   = grouped,
+            active_digests = active or set(),
+            keep_revisions = keep,
+            younger_than   = timedelta(hours=1) if young == "1h" else timedelta(hours=int(young[:-1])),
+            protected_tags = protected or [],
+            _reasons       = reasons,
+        )
+        return reasons
+
+    def test_keep_revisions_reason_tracked(self):
+        grouped = self._grouped("trading", [("2.0.0", 10, "new"), ("1.0.0", 100, "old")])
+        reasons = self._collect(grouped, keep=2)
+        # both tags kept by keep_revisions (rank 0 and 1 < 2)
+        self.assertEqual(reasons.get(("prd-ns", "trading"), {}).get("keep_revisions", 0), 2)
+
+    def test_active_digest_reason_tracked(self):
+        grouped = self._grouped("trading", [("2.0.0", 10, "new"), ("1.0.0", 100, "running")])
+        reasons = self._collect(grouped, active={"sha256:running"}, keep=1)
+        # rank-0 → keep_revisions; rank-1 active digest → active
+        self.assertEqual(reasons[("prd-ns", "trading")]["active"], 1)
+
+    def test_younger_than_reason_tracked(self):
+        # keep=0 so no keep_revisions protection; fresh tag is protected by younger_than
+        grouped = self._grouped("trading", [("2.0.0", 10, "new"), ("1.0.0", 0, "fresh")])
+        reasons = self._collect(grouped, keep=0, young="24h")
+        # "1.0.0" (0 days) → younger than 24h → protected by younger_than
+        self.assertEqual(reasons[("prd-ns", "trading")]["younger_than"], 1)
+
+    def test_protected_tag_reason_tracked(self):
+        grouped = self._grouped("trading", [("latest", 200, "a"), ("1.0.0", 100, "b")])
+        reasons = self._collect(grouped, keep=0, protected=["latest"])
+        self.assertEqual(reasons[("prd-ns", "trading")]["protected_tag"], 1)
+
+    def test_reasons_none_by_default_no_error(self):
+        grouped = self._grouped("trading", [("2.0.0", 10, "new"), ("1.0.0", 100, "old")])
+        # should not raise
+        candidates = collect_tag_candidates(
+            grouped_tags=grouped, active_digests=set(),
+            keep_revisions=1, younger_than=timedelta(hours=1), protected_tags=[],
+        )
+        self.assertEqual(len(candidates), 1)
+
+    def test_run_prune_returns_reasons_tuple(self):
+        """run_prune must return (candidates, reasons) tuple."""
+        ists = [_make_ist("trading", "2.0.0", created_days_ago=10),
+                _make_ist("trading", "1.0.0", created_days_ago=100)]
+        oc = _make_oc_client(istags_by_ns={"prd-ns": ists})
+        result = run_prune(
+            oc_client=oc, keep_revisions=1,
+            younger_than=parse_younger_than("1h"),
+            protected_tags=[], dry_run=True,
+        )
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+
+    def test_run_prune_reasons_contains_keep_revisions(self):
+        """reasons dict from run_prune must contain keep_revisions count."""
+        ists = [_make_ist("trading", "2.0.0", created_days_ago=10),
+                _make_ist("trading", "1.0.0", created_days_ago=100)]
+        oc = _make_oc_client(istags_by_ns={"prd-ns": ists})
+        _, reasons = run_prune(
+            oc_client=oc, keep_revisions=1,
+            younger_than=parse_younger_than("1h"),
+            protected_tags=[], dry_run=True,
+        )
+        self.assertEqual(reasons[("prd-ns", "trading")]["keep_revisions"], 1)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -730,6 +815,36 @@ class TestPrintStreamSummary(unittest.TestCase):
     def test_empty_stats_no_table(self):
         output = self._capture([])
         self.assertEqual(output.strip(), "")
+
+    def test_kept_by_active_shown(self):
+        stats = [self._stat("trading", 5, 2)]
+        stats[0]["kept_by"] = {"active": 2, "keep_revisions": 1}
+        output = self._capture(stats)
+        self.assertIn("active(2)", output)
+
+    def test_kept_by_keep_revisions_shown(self):
+        stats = [self._stat("trading", 5, 0)]
+        stats[0]["kept_by"] = {"keep_revisions": 5}
+        output = self._capture(stats)
+        self.assertIn("keep(5)", output)
+
+    def test_kept_by_young_shown(self):
+        stats = [self._stat("trading", 3, 0)]
+        stats[0]["kept_by"] = {"younger_than": 1}
+        output = self._capture(stats)
+        self.assertIn("young(1)", output)
+
+    def test_kept_by_protected_tag_shown(self):
+        stats = [self._stat("trading", 3, 0)]
+        stats[0]["kept_by"] = {"protected_tag": 1}
+        output = self._capture(stats)
+        self.assertIn("tag(1)", output)
+
+    def test_no_kept_by_no_error(self):
+        """Stats without kept_by key must not crash."""
+        stats = [self._stat("trading", 5, 2)]
+        output = self._capture(stats)
+        self.assertIn("trading", output)
 
 
 # ══════════════════════════════════════════════════════════════════

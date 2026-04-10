@@ -100,16 +100,18 @@ def group_tags_by_stream(ist_items):
 # ============================================================
 
 def collect_tag_candidates(grouped_tags, active_digests,
-                           keep_revisions, younger_than, protected_tags):
+                           keep_revisions, younger_than, protected_tags,
+                           _reasons=None):
     """
     For each stream, keep the N most recent tags, return the rest as candidates.
 
     Safety conditions (any true → skip):
-      1. Tag is rank-0 (newest) — always kept
-      2. Tag is within keep_revisions (newest N)
-      3. Digest is in active_digests
-      4. Tag was created within younger_than
-      5. Tag name is in protected_tags
+      1. Tag is within keep_revisions (newest N)
+      2. Digest is in active_digests
+      3. Tag was created within younger_than
+      4. Tag name is in protected_tags
+
+    Optional _reasons dict: populated with {(ns, stream): {reason: count}} for kept tags.
 
     Returns list of: {namespace, stream, tag, digest, reason}
     """
@@ -123,20 +125,31 @@ def collect_tag_candidates(grouped_tags, active_digests,
             digest = _extract_digest(getattr(ist.image, "dockerImageReference", ""))
             age    = now - _parse_timestamp(ist.metadata.creationTimestamp)
 
+            def _track(reason_key):
+                if _reasons is not None:
+                    key = (ns, stream)
+                    if key not in _reasons:
+                        _reasons[key] = {}
+                    _reasons[key][reason_key] = _reasons[key].get(reason_key, 0) + 1
+
             # Condition 1: within keep window (N most recent)
             if rank < keep_revisions:
+                _track("keep_revisions")
                 continue
 
-            # Condition 3: active digest
+            # Condition 2: active digest
             if digest and digest in (active_digests or set()):
+                _track("active")
                 continue
 
-            # Condition 4: recent entry
+            # Condition 3: recent entry
             if age < younger_than:
+                _track("younger_than")
                 continue
 
-            # Condition 5: protected tag name
+            # Condition 4: protected tag name
             if tag in (protected_tags or []):
+                _track("protected_tag")
                 continue
 
             candidates.append({
@@ -171,10 +184,12 @@ def run_prune(oc_client, keep_revisions, younger_than, protected_tags, dry_run):
     Scan all namespaces in oc_client, collect old tag candidates and
     delete them unless dry_run is True.
 
-    Returns the list of candidates found.
+    Returns (candidates, reasons) where reasons is a dict
+    {(namespace, stream): {reason_key: count}} for kept tags.
     """
     active_digests = set(oc_client._active.keys())
     all_candidates = []
+    all_reasons    = {}
 
     for ns in oc_client.namespaces:
         ist_items  = oc_client.istag_api.get(namespace=ns).items
@@ -185,11 +200,12 @@ def run_prune(oc_client, keep_revisions, younger_than, protected_tags, dry_run):
             keep_revisions = keep_revisions,
             younger_than   = younger_than,
             protected_tags = protected_tags,
+            _reasons       = all_reasons,
         )
         all_candidates.extend(candidates)
 
     if dry_run:
-        return all_candidates
+        return all_candidates, all_reasons
 
     for c in all_candidates:
         try:
@@ -203,7 +219,7 @@ def run_prune(oc_client, keep_revisions, younger_than, protected_tags, dry_run):
         except Exception as e:
             print(f"  ❌ Failed: {c['namespace']} / {c['stream']}:{c['tag']}: {e}")
 
-    return all_candidates
+    return all_candidates, all_reasons
 
 
 # ============================================================
@@ -239,8 +255,28 @@ def print_candidates_table(candidates, max_rows=50):
         print(f"\n   ... and {remaining} more tags")
 
 
+_REASON_LABELS = {
+    "keep_revisions": "keep",
+    "active":         "active",
+    "younger_than":   "young",
+    "protected_tag":  "tag",
+}
+
+
+def _format_kept_by(kept_by):
+    """Format {reason: count} dict into readable string like 'keep(2) active(1)'."""
+    if not kept_by:
+        return ""
+    parts = [
+        f"{_REASON_LABELS.get(k, k)}({v})"
+        for k, v in kept_by.items()
+        if v > 0
+    ]
+    return " ".join(parts)
+
+
 def print_stream_summary(stats):
-    """Print per-stream breakdown: stream | total | kept | candidates."""
+    """Print per-stream breakdown: stream | total | kept | candidates | protected by."""
     if not stats:
         return
 
@@ -250,14 +286,15 @@ def print_stream_summary(stats):
     col_stream = max(len(s["stream"])    for s in sorted_stats)
 
     print(f"\n◈  Stream breakdown\n")
-    print(f"   {'Namespace':<{col_ns}}  {'Stream':<{col_stream}}  {'Total':>6}  {'Kept':>6}  {'Candidates':>10}")
-    print(f"   {'-'*col_ns}  {'-'*col_stream}  {'------':>6}  {'------':>6}  {'----------':>10}")
+    print(f"   {'Namespace':<{col_ns}}  {'Stream':<{col_stream}}  {'Total':>6}  {'Kept':>6}  {'Candidates':>10}  Protected by")
+    print(f"   {'-'*col_ns}  {'-'*col_stream}  {'------':>6}  {'------':>6}  {'----------':>10}  ------------")
 
     for s in sorted_stats:
-        kept = s["total"] - s["candidates"]
+        kept      = s["total"] - s["candidates"]
+        protected = _format_kept_by(s.get("kept_by", {}))
         print(
             f"   {s['namespace']:<{col_ns}}  {s['stream']:<{col_stream}}"
-            f"  {s['total']:>6}  {kept:>6}  {s['candidates']:>10}"
+            f"  {s['total']:>6}  {kept:>6}  {s['candidates']:>10}  {protected}"
         )
 
 
@@ -382,7 +419,7 @@ if __name__ == "__main__":
     print(f"     Cluster state:   {len(oc._active)} active | {len(oc._historical)} historical digests loaded.")
     print(f"     Namespaces:      {len(oc.namespaces)}  ({ns_label})")
 
-    candidates = run_prune(
+    candidates, reasons = run_prune(
         oc_client      = oc,
         keep_revisions = KEEP_REVISIONS,
         younger_than   = YOUNGER_THAN,
@@ -416,6 +453,7 @@ if __name__ == "__main__":
             "stream":     stream,
             "total":      stream_totals[(ns, stream)]["total"],
             "candidates": stream_candidates[(ns, stream)],
+            "kept_by":    reasons.get((ns, stream), {}),
         }
         for (ns, stream) in stream_totals
     ]
