@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-openshift_prune.py — Safely prunes ImageStream history in OpenShift.
+openshift_prune.py — Safely prunes old ImageStream tags in OpenShift.
+
+For the one-tag-per-release pattern (e.g. dotnet-service-trading:5.6.4),
+this script removes entire old tags from ImageStreams so that purge.py
+can then delete the unreferenced images from ACR.
 
 Preserves:
-  1. items[0]              — current entry for each tag (always active)
-  2. active digests        — any digest running in pods, DCs, jobs, etc.
-  3. recent entries        — created within --younger-than window
-  4. last N revisions      — --keep-revisions per tag
-  5. protected tag names   — --protected-tags (e.g. latest,stable,production)
+  1. Rank-0 tag (newest per stream)  — always active
+  2. Keep-N most recent tags         — --keep-revisions per stream
+  3. Active digests                  — any digest running in pods, DCs, jobs, etc.
+  4. Recent tags                     — created within --younger-than window
+  5. Protected tag names             — --protected-tags (e.g. latest,stable,production)
 
-Only entries where ALL 5 conditions are false are candidates for pruning.
+Only tags where ALL 5 conditions are false are candidates for deletion.
 Always dry-run by default. Zero-downtime guarantee by design.
 """
 
@@ -34,88 +38,113 @@ def parse_younger_than(value):
 
 
 # ============================================================
-# CORE DECISION
+# HELPERS
 # ============================================================
 
-def should_prune(entry, tag_name, position, active_digests,
-                 keep_revisions, younger_than, protected_tags):
+def _parse_timestamp(ts):
+    """Parse creationTimestamp (string or datetime) to a UTC-aware datetime."""
+    if isinstance(ts, str):
+        return datetime.fromisoformat(ts).astimezone(timezone.utc)
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            return ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc)
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _extract_digest(docker_image_reference):
+    """Extract sha256:... from a dockerImageReference string."""
+    if not docker_image_reference or "sha256:" not in docker_image_reference:
+        return None
+    try:
+        sha = docker_image_reference.split("sha256:")[1].split()[0].strip("\"'@")
+        return f"sha256:{sha}"
+    except Exception:
+        return None
+
+
+# ============================================================
+# GROUP TAGS BY STREAM
+# ============================================================
+
+def group_tags_by_stream(ist_items):
     """
-    Decide whether a single ImageStream history entry is safe to prune.
+    Groups ImageStreamTag items by stream name, sorted newest-first.
 
-    Returns (can_prune: bool, reason: str).
-    can_prune is True only when ALL 5 safety conditions are false.
+    Each IST has metadata.name = '{stream}:{tag}'.
+
+    Returns: {"stream-name": [ist_newest, ist_older, ...]}
     """
-    digest = entry.image
+    groups = {}
+    for ist in ist_items:
+        parts = ist.metadata.name.split(":", 1)
+        if len(parts) != 2:
+            continue
+        stream = parts[0]
+        if stream not in groups:
+            groups[stream] = []
+        groups[stream].append(ist)
 
-    # Condition 1 — current entry (position 0) is always preserved.
-    if position == 0:
-        return False, "current entry for tag"
+    for stream in groups:
+        groups[stream].sort(
+            key=lambda i: _parse_timestamp(i.metadata.creationTimestamp),
+            reverse=True,
+        )
 
-    # Condition 2 — digest is actively running in the cluster.
-    if digest in active_digests:
-        return False, f"active in cluster: {digest}"
-
-    # Condition 3 — entry is within the younger-than safety window.
-    created    = datetime.fromisoformat(entry.created).astimezone(timezone.utc)
-    age        = datetime.now(timezone.utc) - created
-    if age < younger_than:
-        return False, f"recent entry (age={age})"
-
-    # Condition 4 — entry is within the keep-revisions window.
-    # position 0 is already protected by condition 1.
-    # keep_revisions=2 protects positions 1 and 2.
-    if 0 < position <= keep_revisions:
-        return False, f"within keep-revisions={keep_revisions} (position={position})"
-
-    # Condition 5 — tag name is in the protected list.
-    if tag_name in (protected_tags or []):
-        return False, f"protected_tag:{tag_name}"
-
-    return True, "eligible for pruning"
+    return groups
 
 
 # ============================================================
 # CANDIDATE COLLECTION
 # ============================================================
 
-def collect_prune_candidates(imagestreams, active_digests,
-                              keep_revisions, younger_than, protected_tags):
+def collect_tag_candidates(grouped_tags, active_digests,
+                           keep_revisions, younger_than, protected_tags):
     """
-    Scan a list of ImageStream objects and return all history entries
-    that are safe to prune.
+    For each stream, keep the N most recent tags, return the rest as candidates.
 
-    Each candidate is a dict:
-      { namespace, imagestream, tag, digest, dockerImageReference, reason }
+    Safety conditions (any true → skip):
+      1. Tag is rank-0 (newest) — always kept
+      2. Tag is within keep_revisions (newest N)
+      3. Digest is in active_digests
+      4. Tag was created within younger_than
+      5. Tag name is in protected_tags
+
+    Returns list of: {namespace, stream, tag, digest, reason}
     """
     candidates = []
+    now = datetime.now(timezone.utc)
 
-    for is_obj in imagestreams:
-        ns   = is_obj.metadata.namespace
-        name = is_obj.metadata.name
+    for stream, ists in grouped_tags.items():
+        for rank, ist in enumerate(ists):
+            tag    = ist.metadata.name.split(":", 1)[1]
+            ns     = ist.metadata.namespace
+            digest = _extract_digest(getattr(ist.image, "dockerImageReference", ""))
+            age    = now - _parse_timestamp(ist.metadata.creationTimestamp)
 
-        for tag in (getattr(is_obj.status, "tags", None) or []):
-            tag_name = tag.tag
-            items    = getattr(tag, "items", None) or []
+            # Condition 1: within keep window (N most recent)
+            if rank < keep_revisions:
+                continue
 
-            for position, entry in enumerate(items):
-                can_prune, reason = should_prune(
-                    entry          = entry,
-                    tag_name       = tag_name,
-                    position       = position,
-                    active_digests = active_digests,
-                    keep_revisions = keep_revisions,
-                    younger_than   = younger_than,
-                    protected_tags = protected_tags,
-                )
-                if can_prune:
-                    candidates.append({
-                        "namespace":            ns,
-                        "imagestream":          name,
-                        "tag":                  tag_name,
-                        "digest":               entry.image,
-                        "dockerImageReference": entry.dockerImageReference,
-                        "reason":               reason,
-                    })
+            # Condition 3: active digest
+            if digest and digest in (active_digests or set()):
+                continue
+
+            # Condition 4: recent entry
+            if age < younger_than:
+                continue
+
+            # Condition 5: protected tag name
+            if tag in (protected_tags or []):
+                continue
+
+            candidates.append({
+                "namespace": ns,
+                "stream":    stream,
+                "tag":       tag,
+                "digest":    digest or "",
+                "reason":    "eligible for pruning",
+            })
 
     return candidates
 
@@ -124,10 +153,10 @@ def collect_prune_candidates(imagestreams, active_digests,
 # DELETION
 # ============================================================
 
-def delete_istag_entry(istag_api, namespace, is_name, tag, digest):
-    """Delete one ImageStreamTag history entry via the OpenShift API."""
+def delete_istag(istag_api, namespace, stream, tag):
+    """Delete an entire ImageStreamTag (removes the tag from the ImageStream)."""
     istag_api.delete(
-        name      = f"{is_name}:{tag}@{digest}",
+        name      = f"{stream}:{tag}",
         namespace = namespace,
     )
 
@@ -138,7 +167,7 @@ def delete_istag_entry(istag_api, namespace, is_name, tag, digest):
 
 def run_prune(oc_client, keep_revisions, younger_than, protected_tags, dry_run):
     """
-    Scan all namespaces in oc_client, collect prune candidates and
+    Scan all namespaces in oc_client, collect old tag candidates and
     delete them unless dry_run is True.
 
     Returns the list of candidates found.
@@ -147,9 +176,10 @@ def run_prune(oc_client, keep_revisions, younger_than, protected_tags, dry_run):
     all_candidates = []
 
     for ns in oc_client.namespaces:
-        imagestreams = oc_client.is_api.get(namespace=ns).items
-        candidates   = collect_prune_candidates(
-            imagestreams   = imagestreams,
+        ist_items  = oc_client.istag_api.get(namespace=ns).items
+        grouped    = group_tags_by_stream(ist_items)
+        candidates = collect_tag_candidates(
+            grouped_tags   = grouped,
             active_digests = active_digests,
             keep_revisions = keep_revisions,
             younger_than   = younger_than,
@@ -162,16 +192,15 @@ def run_prune(oc_client, keep_revisions, younger_than, protected_tags, dry_run):
 
     for c in all_candidates:
         try:
-            delete_istag_entry(
+            delete_istag(
                 oc_client.istag_api,
                 c["namespace"],
-                c["imagestream"],
+                c["stream"],
                 c["tag"],
-                c["digest"],
             )
-            print(f"  ✅ {c['namespace']} / {c['imagestream']}:{c['tag']}@{c['digest'][:19]}...")
+            print(f"  ✅ {c['namespace']} / {c['stream']}:{c['tag']}")
         except Exception as e:
-            print(f"  ❌ Failed: {c['namespace']} / {c['imagestream']}:{c['tag']}@{c['digest'][:19]}...: {e}")
+            print(f"  ❌ Failed: {c['namespace']} / {c['stream']}:{c['tag']}: {e}")
 
     return all_candidates
 
@@ -193,9 +222,9 @@ def print_settings(mode, keep_revisions, younger_than, protected_tags):
 def print_summary(candidates, dry_run, namespace_prefix,
                   keep_revisions, younger_than, protected_tags):
     """Print the summary section after pruning."""
-    count     = len(candidates)
-    no_match  = "  ✅ (No images match the pruning criteria)" if count == 0 else ""
-    tags_arg  = f" --protected-tags {','.join(protected_tags)}" if protected_tags else ""
+    count    = len(candidates)
+    no_match = "  ✅ (No images match the pruning criteria)" if count == 0 else ""
+    tags_arg = f" --protected-tags {','.join(protected_tags)}" if protected_tags else ""
 
     print(f"\n◈  Summary\n")
     print(f"   Candidates found:  {count}{no_match}")
@@ -220,15 +249,15 @@ def print_summary(candidates, dry_run, namespace_prefix,
 def parse_args():
     parser = argparse.ArgumentParser(
         prog        = "openshift_prune.py",
-        description = "Safely prune ImageStream history in OpenShift."
+        description = "Safely prune old ImageStream tags in OpenShift."
     )
     parser.add_argument(
         "--keep-revisions",   type=int, default=10,
-        help="Number of historical entries to keep per tag (default: 10)",
+        help="Number of most recent tags to keep per ImageStream (default: 10)",
     )
     parser.add_argument(
         "--younger-than",     default="24h",
-        help="Preserve entries newer than this window (default: 24h). Supports h, m, d.",
+        help="Preserve tags newer than this window (default: 24h). Supports h, m, d.",
     )
     parser.add_argument(
         "--namespace-prefix", default="prd-",
