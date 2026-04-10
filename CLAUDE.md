@@ -24,7 +24,7 @@ python3 -m pytest test_purge.py -v
 
 ## Estado atual
 
-Suite: **228 testes passando** (`test_purge.py` + `test_openshift_prune.py`). Todos os goals P1–P5 + hardening + features adicionais completos.
+Suite: **259 testes passando** (`test_purge.py` + `test_openshift_prune.py`). Todos os goals P1–P5 + hardening + features adicionais completos.
 
 ```bash
 python3 -m pytest test_purge.py test_openshift_prune.py -v
@@ -37,7 +37,7 @@ python3 -m pytest test_purge.py test_openshift_prune.py -v
 - **P3** `_load_all` escaneia namespaces em paralelo; `_add_active`/`_add_historical` protegidos por `threading.Lock`
 - **P4** `_print_candidates_table` aceita `max_rows=50`; exibe rodapé `"... and N more images"` quando truncada
 - **P5** `delete_all_candidates` deleta em paralelo com `concurrency=10`
-- **CLI** todos os parâmetros validados e testados: `--dry-run`, `--auto-approve`, `--keep`, `--max-age-days`, `--prefix`, `--registry`, `--skip-openshift`, `--in-cluster`
+- **CLI** todos os parâmetros validados e testados: `--dry-run`, `--auto-approve`, `--keep`, `--max-age-days`, `--prefix`, `--registry`, `--skip-openshift`, `--in-cluster`, `--protected-tags`
 - **`--protected-tags`** tags nunca deletadas independente da idade (ex: `latest,stable,production`)
 - **Output moderno** cabeçalhos com `◈`, tabelas sem bordas, alinhamento por f-strings, sem `===`
 - **PHASE 2 labels** distingue origem: `[running in pod]`, `[referenced in workload]`, `[in imagestream]`
@@ -62,6 +62,17 @@ Resources escaneados como `_historical` (existência no catálogo, não execuç�
 > Proteção real vem de pods e workloads. Evita que release tags antigas (ex: `1.0.0-release-20231214`)
 > apareçam como `[running]` quando nenhum pod as usa.
 
+### Detecção de cluster (`openshift_client.py`)
+
+**Premissa fundamental:** o app detecta automaticamente o cluster em que o usuário está logado (`oc login`). Não existe prefixo de namespace hardcoded — `namespace_prefix=""` sempre, escaneando todos os projetos acessíveis via Projects API.
+
+**Por que Pod é a fonte mais confiável:**
+Workloads (Deployment, RC, etc.) referenciam imagens por tag (`app:v1.2.3`), não por digest. O campo `status.containerStatuses[].imageID` do Pod contém o digest real em execução. Se `list pods` retornar 403 em algum namespace, os digests daquele namespace não entram em `_active` — o scan fica parcial.
+
+**`permission_incomplete`:** quando qualquer namespace retorna 403/401, a flag é setada silenciosamente e um aviso é exibido ao final do PHASE 2. O app **não bloqueia** as deleções — imagens encontradas em qualquer namespace continuam protegidas, imagens não encontradas continuam deletáveis. Isso é intencional: bloquear tudo em vez de avisar causava 0 deleções mesmo com 6000+ candidatos válidos.
+
+> **Risco:** se o service account não tem `list pods` no namespace da aplicação, imagens em execução podem aparecer como `[not in cluster — safe to delete]`. Garantir RBAC correto é responsabilidade do operador.
+
 ### OpenShift (`openshift_prune.py`)
 
 Script separado para prune do histórico de ImageStream. Útil para times que usam **poucos tags com muitas revisões** (ex: `latest` atualizado semanalmente).
@@ -81,13 +92,16 @@ Script separado para prune do histórico de ImageStream. Útil para times que us
 | `--dry-run` | `true` | `true` = simulação \| `false` = deleta de verdade |
 | `--auto-approve` | `false` | Pula confirmação interativa (usar em pipelines) |
 | `--skip-openshift` | `false` | Pula verificação de cluster |
-| `--in-cluster` | `false` | Carrega kubeconfig de dentro do cluster |
+| `--in-cluster` | `false` | Carrega kubeconfig de dentro do cluster (pipeline pods) |
 | `--protected-tags` | `""` | Tags nunca deletadas (ex: `latest,stable,production`) |
+
+> **Removido:** `--namespace-prefix` foi removido intencionalmente. O cluster é detectado dinamicamente pelo contexto `oc login` ativo — não existe e não deve existir filtro por prefixo de namespace em `purge.py`.
 
 ---
 
 ## Ordem de execução recomendada
 
+**Manual (desenvolvedor logado no cluster):**
 ```
 oc adm prune images --keep-tag-revisions=10 --keep-younger-than=60m --confirm
           ↓
@@ -97,6 +111,23 @@ python3 purge.py --registry <r> --prefix <p> --keep 10 --dry-run false
           ↓
 az acr gc --registry <r>
 ```
+
+**Pipeline (pod dentro do cluster):**
+```
+python3 purge.py \
+  --registry <r> \
+  --prefix <p> \
+  --keep 10 \
+  --dry-run false \
+  --auto-approve \
+  --in-cluster
+```
+
+**Pré-requisitos de RBAC para o service account do pipeline:**
+- `list`, `get` em `pods` em todos os namespaces de aplicação
+- `list`, `get` em `deployments`, `replicationcontrollers`, `statefulsets`, `daemonsets`, `replicasets`, `jobs`, `cronjobs`
+- `list`, `get` em `deploymentconfigs`, `builds`, `buildconfigs`, `imagestreams`, `imagestreamtags` (OpenShift)
+- `list` em `projects` (para descobrir namespaces acessíveis)
 
 ---
 
