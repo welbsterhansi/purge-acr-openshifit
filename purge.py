@@ -29,9 +29,10 @@ def parse_args():
     parser.add_argument("--max-age-days",  type=int, default=15,   help="Minimum age in days for deletion (default: 15)")
     parser.add_argument("--dry-run",       choices=["true", "false"], default="true", help="true = simulate | false = delete for real (default: true)")
     parser.add_argument("--auto-approve",  action="store_true", default=False, help="Skip interactive confirmation — use in pipelines")
-    parser.add_argument("--skip-openshift",action="store_true", default=False, help="Skip OpenShift verification — use when cluster is not accessible")
-    parser.add_argument("--in-cluster",      action="store_true", default=False, help="Load kubeconfig from inside the cluster (for pipeline pods)")
-    parser.add_argument("--protected-tags",  default="",          help="Comma-separated tags that are never deleted (e.g. latest,stable,production)")
+    parser.add_argument("--skip-openshift",   action="store_true", default=False, help="Skip OpenShift verification — use when cluster is not accessible")
+    parser.add_argument("--in-cluster",       action="store_true", default=False, help="Load kubeconfig from inside the cluster (for pipeline pods)")
+    parser.add_argument("--namespace-prefix", default="prd-",      help="Only scan namespaces with this prefix for active digest protection (default: prd-)")
+    parser.add_argument("--protected-tags",   default="",          help="Comma-separated tags that are never deleted (e.g. latest,stable,production)")
 
     return parser.parse_args()
 
@@ -449,6 +450,7 @@ if __name__ == "__main__":
     AUTO_APPROVE   = args.auto_approve
     SKIP_OPENSHIFT  = args.skip_openshift
     IN_CLUSTER      = args.in_cluster
+    NS_PREFIX       = args.namespace_prefix
     PROTECTED_TAGS  = [t.strip() for t in args.protected_tags.split(",") if t.strip()]
 
     run_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
@@ -470,11 +472,12 @@ if __name__ == "__main__":
     else:
         from openshift_client import OpenShiftClient
         try:
-            oc_client = OpenShiftClient(in_cluster=IN_CLUSTER, namespace_prefix="")
+            oc_client = OpenShiftClient(in_cluster=IN_CLUSTER, namespace_prefix=NS_PREFIX)
             if not oc_client.namespaces:
-                print(f"\n  🚫 ABORT: Connected to cluster but found 0 accessible namespaces.")
-                print("     You may be logged into the wrong cluster or lack permissions.")
-                print("     Use --skip-openshift only if you accept running without protection.")
+                print(f"\n  🚫 ABORT: Connected to cluster but found 0 namespaces matching '{NS_PREFIX}'.")
+                print(f"     You may be logged into the wrong cluster.")
+                print(f"     Use --namespace-prefix to specify your environment prefix (e.g. qua-, dev-).")
+                print(f"     Use --skip-openshift only if you accept running without protection.")
                 exit(1)
             print(f"  Cluster state loaded: {len(oc_client._active)} active | {len(oc_client._historical)} historical digest(s)")
             print("  ✅ Connected to OpenShift cluster.")
